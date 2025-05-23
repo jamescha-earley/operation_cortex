@@ -449,7 +449,7 @@ def show_start_screen():
     Welcome to Operation Cortex. Your mission, should you choose to accept it, consists of 2 crucial intelligence-gathering tasks:
     
     1. You will be given access to our database of intercepted messages and mission reports
-    2. For each step, you must solve one intelligence puzzle using our advanced Cortex AI assistant
+    2. For each step, you must solve one intelligence puzzle using our advanced Cortex Agent AI
     
     ### Mission Objectives:
     - Analyze intercepted messages
@@ -461,6 +461,12 @@ def show_start_screen():
     - The Cortex Agents will help you analyze intelligence data
     - You can ask Cortex Agents specific questions about the missions
     - Use the intelligence provided to solve each mission step
+                
+    **Cortex Agents utilize two specialized tools:**
+    - **Cortex Search**: Searches through unstructured mission documents and intelligence reports
+    - **Cortex Analyst**: Analyzes structured data from spy databases and generates SQL queries
+    
+    The agents automatically choose the right tool based on your question to provide comprehensive intelligence analysis.
     
     ### Mission Success Criteria:
     Successfully complete both intelligence tasks to complete the operation.
