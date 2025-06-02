@@ -207,8 +207,8 @@ class SnowflakeConnector:
         return self.execute_non_query(insert_sql)
     
     def get_leaderboard_from_db(self, limit: int = 10) -> Optional[pd.DataFrame]:
-        """Get leaderboard data from database"""
-        # Get best score for each agent
+        """Get leaderboard data from database for today only"""
+        # Get best score for each agent from today only
         query = f"""
         WITH ranked_scores AS (
             SELECT 
@@ -221,6 +221,7 @@ class SnowflakeConnector:
                 MISSION_TIMESTAMP,
                 ROW_NUMBER() OVER (PARTITION BY UPPER(AGENT_NAME) ORDER BY SCORE DESC, COMPLETION_TIME ASC) as rn
             FROM AGENT_LEADERBOARD
+            WHERE DATE(MISSION_TIMESTAMP) = CURRENT_DATE()
         )
         SELECT 
             AGENT_NAME,
@@ -613,12 +614,10 @@ def show_leaderboard():
     
     if db_leaderboard:
         leaderboard_data = db_leaderboard
-        st.caption("📊 Data from database")
     elif 'leaderboard' in st.session_state and st.session_state.leaderboard:
         leaderboard_data = st.session_state.leaderboard
-        st.caption("📱 Session data only")
     else:
-        st.info("No agents have completed missions yet.")
+        st.info("No agents have completed missions today.")
         return
     
     leaderboard_df = pd.DataFrame(leaderboard_data)
@@ -656,7 +655,26 @@ def show_timer_sidebar():
             st.progress(progress, text=progress_text)
             
             st.markdown("---")
-            show_leaderboard()
+            
+            # Show leaderboard table in sidebar
+            st.subheader("🏆 Today's Leaderboard")
+            
+            # Use same data source as main leaderboard
+            db_leaderboard = load_leaderboard_from_db()
+            
+            if db_leaderboard:
+                # Show top 5 in table format for sidebar
+                top_agents = db_leaderboard[:5]
+                sidebar_df = pd.DataFrame(top_agents)
+                
+                # Create compact display dataframe
+                display_df = sidebar_df[['agent_name', 'score', 'accuracy']].copy()
+                display_df.columns = ['Agent', 'Score', 'Accuracy']
+                display_df.index = range(1, len(display_df) + 1)
+                
+                st.dataframe(display_df, use_container_width=True, hide_index=False)
+            else:
+                st.info("No rankings yet today")
 
 def initialize_session_state():
     """Initialize all session state variables"""
@@ -842,13 +860,14 @@ def show_game_screen():
         
         # Display SQL if available
         if st.session_state.cortex_sql:
-            st.code(st.session_state.cortex_sql, language="sql")
-            
-            # Execute and show results
-            results = sf.execute_query(st.session_state.cortex_sql)
-            if results is not None and not results.empty:
-                st.markdown("### SQL Results:")
-                st.dataframe(results, hide_index=True)
+            with st.expander("View Generated SQL"):
+                st.code(st.session_state.cortex_sql, language="sql")
+                
+                # Execute and show results
+                results = sf.execute_query(st.session_state.cortex_sql)
+                if results is not None and not results.empty:
+                    st.markdown("### SQL Results:")
+                    st.dataframe(results, hide_index=True)
     
     # Answer form
     with st.form(key=f"step_{st.session_state.current_step}_form"):
