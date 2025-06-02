@@ -860,14 +860,13 @@ def show_game_screen():
         
         # Display SQL if available
         if st.session_state.cortex_sql:
-            with st.expander("View Generated SQL"):
-                st.code(st.session_state.cortex_sql, language="sql")
-                
-                # Execute and show results
-                results = sf.execute_query(st.session_state.cortex_sql)
-                if results is not None and not results.empty:
-                    st.markdown("### SQL Results:")
-                    st.dataframe(results, hide_index=True)
+            st.code(st.session_state.cortex_sql, language="sql")
+            
+            # Execute and show results
+            results = sf.execute_query(st.session_state.cortex_sql)
+            if results is not None and not results.empty:
+                st.markdown("### SQL Results:")
+                st.dataframe(results, hide_index=True)
     
     # Answer form
     with st.form(key=f"step_{st.session_state.current_step}_form"):
