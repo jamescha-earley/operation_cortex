@@ -5,6 +5,8 @@ import requests
 import json
 import snowflake.connector
 import re
+import time
+from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, List, Tuple
 
 # Configuration
@@ -78,6 +80,8 @@ def clean_text(text: str) -> str:
     text = text.replace('Ican\'t', 'I can\'t')
     text = text.replace('Iwill', 'I will')
     text = text.replace('Iam', 'I am')
+    text = text.replace('thatquestion', 'that question')
+    text = text.replace('knowthe', 'know the')
     
     # Remove standalone numbers that are artifacts (like "1" between words)
     text = re.sub(r'\s+\d+\s+\.', ' .', text)  # Remove numbers before periods
@@ -157,6 +161,81 @@ class SnowflakeConnector:
         except Exception as e:
             st.error(f"Error executing query: {str(e)}")
             return None
+    
+    def execute_non_query(self, query: str) -> bool:
+        """Execute SQL command that doesn't return data (INSERT, UPDATE, DELETE, CREATE)"""
+        try:
+            if not self.password or not self.account:
+                return False
+            
+            # Create connection using Snowflake Python connector
+            conn = snowflake.connector.connect(
+                account=self.account,
+                user=self.username,
+                password=self.password, 
+                warehouse=self.warehouse,
+                database=self.database,
+                schema=self.schema
+            )
+            
+            try:
+                # Execute query
+                cursor = conn.cursor()
+                cursor.execute(query.replace(';', ''))
+                return True
+                
+            finally:
+                # Always close the connection
+                conn.close()
+                
+        except snowflake.connector.errors.DatabaseError as e:
+            st.error(f"Snowflake database error: {str(e)}")
+            return False
+        except Exception as e:
+            st.error(f"Error executing query: {str(e)}")
+            return False
+    
+    def save_leaderboard_entry(self, agent_name: str, completion_time: int, correct_answers: int, 
+                              total_questions: int, accuracy: float, score: int) -> bool:
+        """Save a leaderboard entry to the database"""
+        insert_sql = f"""
+        INSERT INTO AGENT_LEADERBOARD 
+        (AGENT_NAME, COMPLETION_TIME, CORRECT_ANSWERS, TOTAL_QUESTIONS, ACCURACY, SCORE, MISSION_TIMESTAMP)
+        VALUES 
+        ('{agent_name}', {completion_time}, {correct_answers}, {total_questions}, {accuracy}, {score}, CURRENT_TIMESTAMP())
+        """
+        return self.execute_non_query(insert_sql)
+    
+    def get_leaderboard_from_db(self, limit: int = 10) -> Optional[pd.DataFrame]:
+        """Get leaderboard data from database"""
+        # Get best score for each agent
+        query = f"""
+        WITH ranked_scores AS (
+            SELECT 
+                AGENT_NAME,
+                COMPLETION_TIME,
+                CORRECT_ANSWERS,
+                TOTAL_QUESTIONS,
+                ACCURACY,
+                SCORE,
+                MISSION_TIMESTAMP,
+                ROW_NUMBER() OVER (PARTITION BY UPPER(AGENT_NAME) ORDER BY SCORE DESC, COMPLETION_TIME ASC) as rn
+            FROM AGENT_LEADERBOARD
+        )
+        SELECT 
+            AGENT_NAME,
+            COMPLETION_TIME,
+            CORRECT_ANSWERS,
+            TOTAL_QUESTIONS,
+            ACCURACY,
+            SCORE,
+            MISSION_TIMESTAMP
+        FROM ranked_scores 
+        WHERE rn = 1
+        ORDER BY SCORE DESC, COMPLETION_TIME ASC
+        LIMIT {limit}
+        """
+        return self.execute_query(query)
     
     def call_cortex_api(self, query: str, limit: int = 10) -> Optional[requests.Response]:
         """Make a call to Snowflake Cortex API and return raw response"""
@@ -411,12 +490,173 @@ MISSION_QUESTIONS = [
     },
     {
         "mission_id": "M013",
-        "question": "What was the keyphrase mentioned in the Toronto mission?",
+        "question": "What was the keyphrase mentioned in mission M013 (Toronto location)?",
         "answer": "Red Falcon",
-        "hint": "Review the intercepted messages from Toronto.",
-        "cortex_query": "What keyphrase was mentioned in the Toronto mission?"
+        "hint": "Look specifically for mission M013 in the Toronto location and find the keyphrase mentioned.",
+        "cortex_query": "What is the keyphrase mentioned in mission M013 that took place in Toronto?"
     }
 ]
+
+# Leaderboard functions
+def save_to_leaderboard(agent_name: str, completion_time: int, correct_answers: int, total_questions: int):
+    """Save player results to leaderboard (both session state and database)"""
+    if 'leaderboard' not in st.session_state:
+        st.session_state.leaderboard = []
+    
+    # Calculate score (prioritize correct answers, then speed)
+    accuracy = correct_answers / total_questions
+    # Score: accuracy weight (70%) + speed weight (30%), normalized to 1000 points
+    speed_score = max(0, 1000 - completion_time) / 1000  # Lower time = higher score
+    total_score = int((accuracy * 700) + (speed_score * 300))
+    
+    new_entry = {
+        'agent_name': agent_name,
+        'completion_time': completion_time,
+        'correct_answers': correct_answers,
+        'total_questions': total_questions,
+        'accuracy': f"{accuracy*100:.1f}%",
+        'score': total_score,
+        'timestamp': datetime.now()
+    }
+    
+    # Save to database if Snowflake is available
+    sf = get_snowflake_connector()
+    db_saved = False
+    
+    if sf.password:
+        try:
+            # Save to database
+            db_saved = sf.save_leaderboard_entry(
+                agent_name=agent_name,
+                completion_time=completion_time,
+                correct_answers=correct_answers,
+                total_questions=total_questions,
+                accuracy=accuracy,
+                score=total_score
+            )
+            
+            if db_saved:
+                st.success("✅ Results saved to database!")
+            else:
+                st.warning("⚠️ Could not save to database, using session storage.")
+                
+        except Exception as e:
+            st.warning(f"⚠️ Database error: {str(e)}. Using session storage.")
+    
+    # Handle session state leaderboard (fallback or supplement)
+    existing_index = None
+    for i, entry in enumerate(st.session_state.leaderboard):
+        if entry['agent_name'].lower() == agent_name.lower():
+            existing_index = i
+            break
+    
+    # If agent exists, update only if new score is better
+    if existing_index is not None:
+        existing_entry = st.session_state.leaderboard[existing_index]
+        if total_score > existing_entry['score']:
+            st.session_state.leaderboard[existing_index] = new_entry
+            if not db_saved:  # Only show this if not already shown for DB save
+                st.success(f"🎉 New personal best! Previous score: {existing_entry['score']}")
+        else:
+            if not db_saved:  # Only show this if not already shown for DB save
+                st.info(f"Score: {total_score}. Your best remains: {existing_entry['score']}")
+            return  # Don't update leaderboard
+    else:
+        # New agent, add to leaderboard
+        st.session_state.leaderboard.append(new_entry)
+    
+    # Sort by score (highest first), then by time (fastest first)
+    st.session_state.leaderboard.sort(key=lambda x: (-x['score'], x['completion_time']))
+    
+    # Keep only top 10
+    st.session_state.leaderboard = st.session_state.leaderboard[:10]
+
+def load_leaderboard_from_db():
+    """Load leaderboard from database if available"""
+    sf = get_snowflake_connector()
+    
+    if not sf.password:
+        return None
+    
+    try:
+        # Try to get leaderboard from database
+        df = sf.get_leaderboard_from_db(10)
+        
+        if df is not None and not df.empty:
+            # Convert to session state format
+            leaderboard = []
+            for _, row in df.iterrows():
+                entry = {
+                    'agent_name': row['AGENT_NAME'],
+                    'completion_time': int(row['COMPLETION_TIME']),
+                    'correct_answers': int(row['CORRECT_ANSWERS']),
+                    'total_questions': int(row['TOTAL_QUESTIONS']),
+                    'accuracy': f"{float(row['ACCURACY'])*100:.1f}%",
+                    'score': int(row['SCORE']),
+                    'timestamp': row['MISSION_TIMESTAMP']
+                }
+                leaderboard.append(entry)
+            
+            return leaderboard
+        
+    except Exception as e:
+        st.warning(f"Could not load leaderboard from database: {str(e)}")
+    
+    return None
+
+def show_leaderboard():
+    """Display the leaderboard"""
+    st.subheader("🏆 Agent Leaderboard")
+    
+    # Try to load from database first
+    db_leaderboard = load_leaderboard_from_db()
+    
+    if db_leaderboard:
+        leaderboard_data = db_leaderboard
+        st.caption("📊 Data from database")
+    elif 'leaderboard' in st.session_state and st.session_state.leaderboard:
+        leaderboard_data = st.session_state.leaderboard
+        st.caption("📱 Session data only")
+    else:
+        st.info("No agents have completed missions yet.")
+        return
+    
+    leaderboard_df = pd.DataFrame(leaderboard_data)
+    
+    # Format the display
+    display_df = leaderboard_df[['agent_name', 'score', 'accuracy', 'completion_time', 'correct_answers', 'total_questions']].copy()
+    display_df.columns = ['Agent Name', 'Score', 'Accuracy', 'Time (s)', 'Correct', 'Total']
+    display_df.index = range(1, len(display_df) + 1)
+    
+    st.dataframe(display_df, use_container_width=True)
+
+def format_time(seconds):
+    """Format time in MM:SS format"""
+    minutes = int(seconds // 60)
+    seconds = int(seconds % 60)
+    return f"{minutes:02d}:{seconds:02d}"
+
+def show_timer_sidebar():
+    """Display timer in sidebar"""
+    if 'start_time' in st.session_state and st.session_state.start_time:
+        elapsed_time = time.time() - st.session_state.start_time
+        
+        with st.sidebar:
+            st.markdown("### ⏱️ Mission Timer")
+            st.markdown(f"## {format_time(elapsed_time)}")
+            
+            # Show progress - handle completion state
+            if st.session_state.game_completed:
+                progress = 1.0
+                progress_text = "Mission Complete!"
+            else:
+                progress = (st.session_state.current_step - 1) / 2
+                progress_text = f"Step {st.session_state.current_step}/2"
+            
+            st.progress(progress, text=progress_text)
+            
+            st.markdown("---")
+            show_leaderboard()
 
 def initialize_session_state():
     """Initialize all session state variables"""
@@ -426,9 +666,14 @@ def initialize_session_state():
         'current_step': 1,
         'selected_questions': random.sample(MISSION_QUESTIONS, 2),
         'correct_answers': 0,
+        'total_answers': 0,
         'cortex_response': None,
         'cortex_sql': None,
-        'cortex_citations': []
+        'cortex_citations': [],
+        'start_time': None,
+        'completion_time': None,
+        'agent_name': '',
+        'leaderboard': []
     }
     
     for key, default_value in defaults.items():
@@ -469,22 +714,56 @@ def show_start_screen():
     The agents automatically choose the right tool based on your question to provide comprehensive intelligence analysis.
     
     ### Mission Success Criteria:
-    Successfully complete both intelligence tasks to complete the operation.
+    Complete both intelligence tasks as quickly and accurately as possible to earn a high score on the leaderboard!
     
     *This briefing will self-destruct when you begin the mission.*
     """)
     
-    if st.button("BEGIN MISSION", key="start_button", type="primary"):
+    # Check for existing names in database
+    def check_name_exists(name: str) -> bool:
+        """Check if agent name already exists in database"""
+        if not sf.password:
+            # If no database, check session state
+            if 'leaderboard' in st.session_state:
+                return any(entry['agent_name'].lower() == name.lower() for entry in st.session_state.leaderboard)
+            return False
+        
+        try:
+            query = f"SELECT COUNT(*) as count FROM AGENT_LEADERBOARD WHERE UPPER(AGENT_NAME) = UPPER('{name}')"
+            result = sf.execute_query(query)
+            if result is not None and not result.empty:
+                return result.iloc[0]['COUNT'] > 0
+        except Exception:
+            pass
+        return False
+    
+    # Agent name input
+    agent_name = st.text_input("Enter your agent codename:", placeholder="Your Name")
+    
+    # Check if name already exists
+    name_exists = False
+    if agent_name.strip():
+        name_exists = check_name_exists(agent_name.strip())
+        if name_exists:
+            st.error("🚫 This agent codename is already taken. Please choose a different name.")
+    
+    if st.button("BEGIN MISSION", key="start_button", type="primary", disabled=not agent_name.strip() or name_exists):
+        st.session_state.agent_name = agent_name.strip()
         st.session_state.game_started = True
+        st.session_state.start_time = time.time()
         st.rerun()
 
 def show_game_screen():
+    # Show timer in sidebar
+    show_timer_sidebar()
+    
     if st.session_state.game_completed:
         show_mission_complete()
         return
     
     # Header
     st.title(f"🕵️ Operation Cortex: Step {st.session_state.current_step}/2")
+    st.markdown(f"**Agent: {st.session_state.agent_name}**")
     
     # Get current question
     current_question = st.session_state.selected_questions[st.session_state.current_step - 1]
@@ -563,14 +842,13 @@ def show_game_screen():
         
         # Display SQL if available
         if st.session_state.cortex_sql:
-            with st.expander("View Generated SQL"):
-                st.code(st.session_state.cortex_sql, language="sql")
-                
-                # Execute and show results
-                results = sf.execute_query(st.session_state.cortex_sql)
-                if results is not None and not results.empty:
-                    st.markdown("### SQL Results:")
-                    st.dataframe(results, hide_index=True)
+            st.code(st.session_state.cortex_sql, language="sql")
+            
+            # Execute and show results
+            results = sf.execute_query(st.session_state.cortex_sql)
+            if results is not None and not results.empty:
+                st.markdown("### SQL Results:")
+                st.dataframe(results, hide_index=True)
     
     # Answer form
     with st.form(key=f"step_{st.session_state.current_step}_form"):
@@ -582,60 +860,131 @@ def show_game_screen():
         
         submitted = st.form_submit_button("Submit Answer", type="primary")
         
-        if submitted:
+        if submitted and user_answer.strip():
+            st.session_state.total_answers += 1
+            
             if user_answer.lower() == current_question["answer"].lower():
                 st.success("✅ Correct! Intelligence verified.")
                 st.session_state.correct_answers += 1
-                
-                # Advance to next step or complete game
-                if st.session_state.current_step < 2:
-                    st.session_state.current_step += 1
-                    # Reset Cortex responses for next step
-                    st.session_state.cortex_response = None
-                    st.session_state.cortex_sql = None
-                    st.session_state.cortex_citations = []
-                    st.rerun()
-                else:
-                    st.session_state.game_completed = True
-                    st.rerun()
             else:
-                st.error("❌ Incorrect. Review the intelligence and try again.")
+                st.error(f"❌ Incorrect. The correct answer was: **{current_question['answer']}**")
+            
+            # Advance to next step or complete game
+            if st.session_state.current_step < 2:
+                st.session_state.current_step += 1
+                # Reset Cortex responses for next step
+                st.session_state.cortex_response = None
+                st.session_state.cortex_sql = None
+                st.session_state.cortex_citations = []
+                st.rerun()
+            else:
+                # Calculate completion time
+                st.session_state.completion_time = int(time.time() - st.session_state.start_time)
+                st.session_state.game_completed = True
+                st.rerun()
 
 def show_mission_complete():
     st.title("🕵️ Mission Debriefing")
     
+    # Calculate final score and save to leaderboard
+    if st.session_state.completion_time and st.session_state.agent_name:
+        save_to_leaderboard(
+            st.session_state.agent_name,
+            st.session_state.completion_time,
+            st.session_state.correct_answers,
+            2  # total questions
+        )
+    
+    # Show results
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.markdown("### 📊 Mission Results")
+        st.metric("Correct Answers", f"{st.session_state.correct_answers}/2")
+        st.metric("Completion Time", format_time(st.session_state.completion_time))
+        
+        accuracy = st.session_state.correct_answers / 2
+        st.metric("Accuracy", f"{accuracy*100:.1f}%")
+    
+    with col2:
+        st.markdown("### 🏆 Your Ranking")
+        # Find current agent's position in leaderboard
+        current_score = 0
+        position = "Not ranked"
+        
+        # Try to get position from database leaderboard first
+        db_leaderboard = load_leaderboard_from_db()
+        
+        if db_leaderboard:
+            # Use database leaderboard for position
+            for i, entry in enumerate(db_leaderboard):
+                if entry['agent_name'].lower() == st.session_state.agent_name.lower():
+                    position = f"#{i + 1} of {len(db_leaderboard)}"
+                    current_score = entry['score']
+                    break
+        elif 'leaderboard' in st.session_state and st.session_state.leaderboard:
+            # Fallback to session state leaderboard
+            for i, entry in enumerate(st.session_state.leaderboard):
+                if entry['agent_name'].lower() == st.session_state.agent_name.lower():
+                    position = f"#{i + 1} of {len(st.session_state.leaderboard)}"
+                    current_score = entry['score']
+                    break
+        
+        st.metric("Final Score", current_score)
+        st.metric("Leaderboard Position", position)
+    
+    # Mission outcome message
     if st.session_state.correct_answers == 2:
         st.markdown("""
         ## 🌟 MISSION ACCOMPLISHED 🌟
         
         **Congratulations, Agent!**
         
-        You have successfully completed all intelligence tasks. Your analytical skills have proven invaluable to the agency.
+        You have successfully completed all intelligence tasks with perfect accuracy. Your analytical skills have proven invaluable to the agency.
         
         The intelligence you've gathered will be crucial for our ongoing operations. Your performance has been noted in your service record.
         """)
-    else:
+    elif st.session_state.correct_answers == 1:
         st.markdown("""
-        ## MISSION PARTIALLY SUCCESSFUL
+        ## 🔍 MISSION PARTIALLY SUCCESSFUL
         
         **Agent,**
         
-        While you were able to gather some valuable intelligence, not all tasks were completed successfully.
+        You successfully completed 50% of the intelligence tasks. While not perfect, you've gathered valuable intelligence for the agency.
         
-        Further training may be required before your next field assignment.
+        Consider reviewing the mission data more carefully in future operations.
+        """)
+    else:
+        st.markdown("""
+        ## ⚠️ MISSION NEEDS IMPROVEMENT
+        
+        **Agent,**
+        
+        While you completed the mission timeline, the intelligence gathered was not accurate. 
+        
+        Additional training is recommended before your next field assignment.
         """)
     
+    # Show leaderboard
+    st.markdown("---")
+    show_leaderboard()
+    
     if st.button("START NEW MISSION", type="primary"):
-        # Reset game state
-        for key in ['game_started', 'game_completed', 'current_step', 'correct_answers', 
-                   'cortex_response', 'cortex_sql', 'cortex_citations']:
+        # Reset game state but keep leaderboard
+        keys_to_reset = ['game_started', 'game_completed', 'current_step', 'correct_answers', 
+                        'total_answers', 'cortex_response', 'cortex_sql', 'cortex_citations',
+                        'start_time', 'completion_time', 'agent_name']
+        
+        for key in keys_to_reset:
             if key in st.session_state:
                 if key == 'current_step':
                     st.session_state[key] = 1
-                elif key == 'correct_answers':
+                elif key in ['correct_answers', 'total_answers']:
                     st.session_state[key] = 0
+                elif key in ['game_started', 'game_completed']:
+                    st.session_state[key] = False
                 else:
-                    st.session_state[key] = False if 'game' in key else None
+                    st.session_state[key] = None if key != 'agent_name' else ''
         
         st.session_state.selected_questions = random.sample(MISSION_QUESTIONS, 2)
         st.rerun()
