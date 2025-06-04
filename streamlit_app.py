@@ -815,7 +815,7 @@ def show_game_screen():
     with st.form(key="cortex_form"):
         cortex_query = st.text_input(
             "Ask Cortex Agents a question:",
-            value=current_question["cortex_query"],
+            value="What is your question?",
             key="cortex_input"
         )
         
